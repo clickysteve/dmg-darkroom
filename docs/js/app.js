@@ -6,7 +6,7 @@
  *   - palettes.js → window.PALETTES, window.paletteToRGB
  */
 
-const APP_VERSION = 'v1.2.5';
+const APP_VERSION = 'v1.2.6';
 
 // ── Border frames ─────────────────────────────────────────────────────────────
 
@@ -480,6 +480,7 @@ const state = {
   gifPaletteScope: null,   // null=global; number=frame order index being re-palettted
   gifDelay: 250,           // ms per frame
   gifLoop: 'infinite',     // 'infinite' | 'once' | 'bounce'
+  gifBorders: false,       // include each frame's border frame in the exported GIF
   activeFilters:   new Set(),        // active filter names for stackable effects
   sectionEnabled:  { exposure: false, splitTone: false, effects: false }, // per-section on/off (off by default)
   effectsPreviewMode: false, // toggle before/after for effects; false = effects visible (normal rendering)
@@ -1681,6 +1682,55 @@ function setGifLoop(mode) {
   if (state.gifMode && state.gifSelection.size > 0) updateGifPreview();
 }
 
+/**
+ * Render one GIF frame (photo + optional border) onto ctx.canvas at the given scale.
+ * When includeBorders is on, every frame is rendered at 160x144 (native) so all GIF
+ * frames share dimensions: photos with a border get the colorised frame, photos without
+ * one are centred on the darkest palette colour. Returns native (unscaled) { width, height }.
+ */
+function renderGifFrameToCanvas(ctx, photo, eff, pal, idx, scale, includeBorders) {
+  if (!includeBorders) {
+    renderPhotoWithTransform(ctx, photo, pal, scale, idx);
+    return { width: GBCam.PHOTO_WIDTH, height: GBCam.PHOTO_HEIGHT };
+  }
+
+  const hasBorder = eff.borderEnabled && eff.borderId && eff.borderId !== 'none';
+  if (hasBorder) {
+    // Reuse the still-export compositor: photo drawn into the window + colorised border.
+    renderPhotoWithBorder(ctx, photo, { palette: pal, borderEnabled: true, borderId: eff.borderId }, scale, idx);
+  } else {
+    // No border on this photo — pad to 160×144 on the darkest palette colour, photo centred.
+    const W = 160 * scale, H = 144 * scale;
+    ctx.canvas.width  = W;
+    ctx.canvas.height = H;
+    const rgb = paletteToRGB(pal);
+    ctx.fillStyle = `rgb(${rgb[3][0]},${rgb[3][1]},${rgb[3][2]})`;
+    ctx.fillRect(0, 0, W, H);
+    const tmp = document.createElement('canvas');
+    renderPhotoWithTransform(tmp.getContext('2d', { willReadFrequently: true }), photo, pal, scale, idx);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(tmp, Math.round((W - tmp.width) / 2), Math.round((H - tmp.height) / 2));
+  }
+  return { width: 160, height: 144 };
+}
+
+/** Map a composited RGB canvas back to 2-bit palette indices (exact — every pixel is a palette colour). */
+function canvasToPaletteIndices(ctx, w, h, rgb) {
+  const data = ctx.getImageData(0, 0, w, h).data;
+  const indices = new Array(w * h);
+  for (let p = 0; p < w * h; p++) {
+    const r = data[p * 4], g = data[p * 4 + 1], b = data[p * 4 + 2];
+    let best = 0, bestD = Infinity;
+    for (let k = 0; k < rgb.length; k++) {
+      const dr = r - rgb[k][0], dg = g - rgb[k][1], db = b - rgb[k][2];
+      const d2 = dr * dr + dg * dg + db * db;
+      if (d2 < bestD) { bestD = d2; best = k; }
+    }
+    indices[p] = best;
+  }
+  return indices;
+}
+
 async function exportGif() {
   if (state.gifFrameOrder.length === 0) {
     showToast('Add frames first');
@@ -1703,6 +1753,10 @@ async function exportGif() {
     }
 
     const frames = [];
+    const includeBorders = state.gifBorders;
+    // Reusable canvas for border compositing (only used when includeBorders is on)
+    const composite = includeBorders ? document.createElement('canvas') : null;
+    const compCtx = composite ? composite.getContext('2d', { willReadFrequently: true }) : null;
 
     for (const frame of sequence) {
       const photo = state.photos[frame.photoIndex];
@@ -1710,12 +1764,25 @@ async function exportGif() {
       // Per-frame override → per-photo effective palette → global palette
       const eff = getEffectiveSettings(frame.photoIndex);
       const pal = (frame.paletteId && PALETTES[frame.paletteId]) || eff.palette;
-      frames.push({
-        indices: Array.from(photo.pixels),
-        palette: paletteToRGB(pal),
-        width:   GBCam.PHOTO_WIDTH,
-        height:  GBCam.PHOTO_HEIGHT,
-      });
+      const rgb = paletteToRGB(pal);
+
+      if (includeBorders) {
+        // Composite photo + border at native resolution (scale 1), then re-index to 2-bit.
+        const dims = renderGifFrameToCanvas(compCtx, photo, eff, pal, frame.photoIndex, 1, true);
+        frames.push({
+          indices: canvasToPaletteIndices(compCtx, dims.width, dims.height, rgb),
+          palette: rgb,
+          width:   dims.width,
+          height:  dims.height,
+        });
+      } else {
+        frames.push({
+          indices: Array.from(photo.pixels),
+          palette: rgb,
+          width:   GBCam.PHOTO_WIDTH,
+          height:  GBCam.PHOTO_HEIGHT,
+        });
+      }
     }
 
     if (frames.length === 0) { showToast('No valid frames'); return; }
@@ -2176,6 +2243,12 @@ function wireButtons() {
   // GIF loop mode
   document.querySelectorAll('.gif-loop-btn').forEach(btn => {
     btn.addEventListener('click', () => setGifLoop(btn.dataset.loop));
+  });
+
+  // GIF border toggle — include each frame's border in the exported GIF (and preview)
+  document.getElementById('gif-borders')?.addEventListener('change', (e) => {
+    state.gifBorders = e.target.checked;
+    if (state.gifMode && state.gifSelection.size > 0) updateGifPreview();
   });
 
   // GIF delay slider
@@ -3174,12 +3247,12 @@ function updateGifPreview() {
     if (!photo || photo.isEmpty) { frameIdx++; return; }
 
     const canvas = sharedCanvas;
-    canvas.width  = GBCam.PHOTO_WIDTH  * PREVIEW_SCALE;
-    canvas.height = GBCam.PHOTO_HEIGHT * PREVIEW_SCALE;
     const frameCtx = canvas.getContext('2d', { willReadFrequently: true });
     const effGif = getEffectiveSettings(frameObj.photoIndex);
     const pal = frameObj.paletteId ? PALETTES[frameObj.paletteId] : effGif.palette;
-    GBCam.renderToCanvas(frameCtx, photo.pixels, pal, PREVIEW_SCALE);
+    // Renders bare photo, or photo + border when the GIF "Borders" toggle is on.
+    // Sets canvas.width/height itself (128x112 or 160x144, scaled).
+    renderGifFrameToCanvas(frameCtx, photo, effGif, pal, frameObj.photoIndex, PREVIEW_SCALE, state.gifBorders);
     if (effGif.activeFilters.size > 0) {
       applyActiveEffects(frameCtx, canvas.width, canvas.height, PREVIEW_SCALE,
         effGif.filterIntensity, effGif.filterVariant, effGif.filterParams, effGif.activeFilters, false, frameObj.photoIndex);
@@ -4769,6 +4842,7 @@ function buildProjectJson() {
       toneBalance:     state.toneBalance,
       gifDelay:        state.gifDelay,
       gifLoop:         state.gifLoop,
+      gifBorders:      state.gifBorders,
       photoSettings:   state.photoSettings,
       photoTransforms: state.photoTransforms,
       filterOrder:     state.filterOrder,
@@ -4833,6 +4907,11 @@ async function openProject() {
     if (dom.gifDelayVal) dom.gifDelayVal.textContent = `${s.gifDelay}ms`;
   }
   if (s.gifLoop) setGifLoop(s.gifLoop);
+  if (typeof s.gifBorders === 'boolean') {
+    state.gifBorders = s.gifBorders;
+    const cb = document.getElementById('gif-borders');
+    if (cb) cb.checked = s.gifBorders;
+  }
   if (s.photoSettings && typeof s.photoSettings === 'object') {
     // Restore with integer-keyed entries (JSON keys are strings, convert back)
     state.photoSettings = {};

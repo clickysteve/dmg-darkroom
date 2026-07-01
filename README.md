@@ -33,7 +33,7 @@
 
 **Export**
 - Batch PNG export at any scale with palettes and effects applied
-- Animated GIF builder — drag-to-reorder frames, per-frame palette, bounce mode, loop controls
+- Animated GIF builder — drag-to-reorder frames, per-frame palette, optional border frames, bounce mode, loop controls
 - Contact sheet — all 30 photos in one image
 
 **Loading**
