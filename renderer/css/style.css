@@ -941,6 +941,24 @@ input[type="range"] {
   white-space: nowrap;
 }
 
+.gif-border-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--yellow);
+  white-space: nowrap;
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+
+.gif-border-toggle input {
+  accent-color: var(--yellow);
+  cursor: pointer;
+  margin: 0;
+}
+
 .gif-loop-seg {
   flex-shrink: 0;
 }
