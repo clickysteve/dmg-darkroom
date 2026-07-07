@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog, Menu, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { Worker } = require('worker_threads');
 
 // ─── GB Camera 2bpp preview decoder ─────────────────────────────────────────
 // Inline port of the decode logic from renderer/js/gbcam.js (Node-safe, no DOM).
@@ -73,8 +74,21 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
     },
+  });
+
+  // Route external links to the OS browser instead of opening in-app windows
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  // Block in-app navigation away from the bundled UI
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!url.startsWith('file://')) {
+      event.preventDefault();
+      if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    }
   });
 
   mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
@@ -283,6 +297,10 @@ ipcMain.handle('read-file', async (_event, saveObj) => {
   const filePath = typeof saveObj === 'string' ? saveObj : saveObj.path;
   try {
     const buffer = fs.readFileSync(filePath);
+    // Validate: GB Camera SRAM is always 128KB (same check as open-sav-file)
+    if (buffer.length !== 131072) {
+      return { error: `Unexpected file size: ${buffer.length} bytes (expected 131072). This might not be a GB Camera save.` };
+    }
     return {
       buffer: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
       name: path.basename(filePath),
@@ -326,11 +344,16 @@ ipcMain.handle('save-gif', async (_event, options) => {
   if (canceled || !filePath) return null;
 
   try {
-    const gifBuffer = encodeGif(frames, delay, scale, loop);
+    // Encode in a worker thread so large exports don't freeze the main process.
+    const gifBuffer = await encodeGifInWorker({ frames, delay, scale, loop }, (p) => {
+      mainWindow?.webContents.send('gif-progress', p);
+    });
     fs.writeFileSync(filePath, gifBuffer);
     return filePath;
   } catch (e) {
     return { error: e.message };
+  } finally {
+    mainWindow?.webContents.send('gif-progress', null); // done/reset
   }
 });
 
@@ -405,61 +428,41 @@ ipcMain.handle('reveal-in-finder', async (_event, filePath) => {
 
 // ─── IPC: Fetch JSON (for Lospec palette import) ─────────────────────────────
 // Fetched in main process so it bypasses renderer CSP and CORS restrictions.
+// Host allow-list: only palette sources — this must not act as a generic proxy.
+
+const FETCH_JSON_ALLOWED_HOSTS = new Set(['lospec.com', 'www.lospec.com']);
 
 ipcMain.handle('fetch-json', async (_event, url) => {
-  const res = await fetch(url);
+  let parsed;
+  try { parsed = new URL(url); } catch (_) { throw new Error('Invalid URL'); }
+  if (parsed.protocol !== 'https:' || !FETCH_JSON_ALLOWED_HOSTS.has(parsed.hostname)) {
+    throw new Error(`Fetching from ${parsed.hostname || url} is not allowed`);
+  }
+  const res = await fetch(parsed.href);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 });
 
-// ─── GIF Encoder ────────────────────────────────────────────────────────────
+// ─── GIF Encoder (worker thread) ─────────────────────────────────────────────
+// Encoding runs in src/gif-encoder-worker.js so a big export (e.g. 20×, 30
+// frames) doesn't block IPC / menus / window painting in the main process.
 
-function scaleIndices(indices, width, height, scale) {
-  if (scale === 1) return indices;
-  const sw = width * scale;
-  const sh = height * scale;
-  const out = new Uint8Array(sw * sh);
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const val = indices[y * width + x];
-      for (let dy = 0; dy < scale; dy++) {
-        for (let dx = 0; dx < scale; dx++) {
-          out[(y * scale + dy) * sw + (x * scale + dx)] = val;
-        }
+function encodeGifInWorker(payload, onProgress) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(path.join(__dirname, 'src', 'gif-encoder-worker.js'));
+    const cleanup = () => worker.terminate().catch(() => {});
+    worker.on('message', (msg) => {
+      if (msg && typeof msg.progress === 'number') {
+        onProgress?.(msg.progress);
+      } else if (msg && msg.done) {
+        cleanup();
+        resolve(Buffer.from(msg.buffer));
+      } else if (msg && msg.error) {
+        cleanup();
+        reject(new Error(msg.error));
       }
-    }
-  }
-  return out;
-}
-
-function encodeGif(frames, delayMs, scale, loop) {
-  const { GifWriter } = require('omggif');
-
-  const width = frames[0].width * scale;
-  const height = frames[0].height * scale;
-  const delayCs = Math.max(1, Math.round(delayMs / 10)); // centiseconds
-
-  // loop: 'infinite' or 'bounce' → repeat forever (0); 'once' → no Netscape extension
-  const gwOpts = (loop === 'once') ? {} : { loop: 0 };
-
-  // Allocate a buffer large enough (frames × pixels × worst-case LZW expansion)
-  const bufSize = width * height * frames.length * 2 + 100000;
-  const buf = Buffer.alloc(bufSize);
-  const gw = new GifWriter(buf, width, height, gwOpts);
-
-  for (const frame of frames) {
-    const scaled = scaleIndices(new Uint8Array(frame.indices), frame.width, frame.height, scale);
-    // omggif expects palette as [0xRRGGBB, ...]
-    const palette = frame.palette.map(([r, g, b]) => (r << 16) | (g << 8) | b);
-    // Pad palette to power of 2 (minimum 4 entries for 2-bit)
-    while (palette.length < 4) palette.push(0);
-
-    gw.addFrame(0, 0, width, height, scaled, {
-      palette,
-      delay: delayCs,
-      disposal: 2,
     });
-  }
-
-  return buf.slice(0, gw.end());
+    worker.on('error', (err) => { cleanup(); reject(err); });
+    worker.postMessage(payload);
+  });
 }

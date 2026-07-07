@@ -1,0 +1,12 @@
+{
+  "name": "DMG DarkRoom",
+  "short_name": "DarkRoom",
+  "description": "Game Boy Camera darkroom — load .sav files, browse photos, apply palettes and effects, export.",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#111113",
+  "theme_color": "#111113",
+  "icons": [
+    { "src": "icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any" }
+  ]
+}

@@ -41,6 +41,15 @@
 - Analogue Pocket SD card support
 - Save and reload project files (`.gbcp`)
 
+**Recovery & album**
+- Photos display in their true in-camera album order (bank 0 state vector)
+- Deleted-photo recovery — photos deleted in-camera but not yet overwritten are shown with a "recovered" badge
+- Hidden "last seen" image from the start of SRAM shown as an extra slot (LS)
+
+**Import**
+- Import any image into an empty photo slot — cover-cropped to 128×112 and dithered to 4 shades (Bayer ordered dithering), written back with thumbnail, metadata, and album entry
+- Export the modified `.sav` for use in emulators, flash carts, and other tools
+
 ---
 
 ## Keyboard shortcuts
@@ -89,13 +98,15 @@
 
 Open **[dmgdarkroom.allmyfriendsarejpegs.com](https://dmgdarkroom.allmyfriendsarejpegs.com)** in Chrome or Edge for the best experience (full File System Access API). Firefox and Safari work with standard file pickers.
 
-No installation. No sign-up. Runs entirely in your browser.
+No installation. No sign-up. Runs entirely in your browser — and works offline once loaded (installable as a PWA).
 
 ---
 
 ## Technical notes
 
 - Game Boy Camera SRAM: 128KB, photos at `0x2000`, 30 slots × 3584 bytes, 128×112px 2bpp
+- Bank 0 album state vector at `0x11B2`: 30 bytes, one per slot — album position, or `0xFF` for deleted/unused (used for album ordering, deleted-photo recovery, and empty-slot detection)
+- "Last seen" working image: 3584 bytes at `0x0000`, same tile format
 - `.srm` files are raw SRAM dumps in RetroArch format — identical structure to `.sav`
 
 ---

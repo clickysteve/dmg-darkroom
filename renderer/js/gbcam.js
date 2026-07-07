@@ -38,6 +38,12 @@ window.GBCam = (() => {
   const PHOTO_DATA_OFFSET = 0x2000;  // Start of photo data in SRAM
   const SRAM_SIZE         = 131072;  // 128KB
 
+  // Bank 0 structures
+  const LAST_SEEN_OFFSET    = 0x0000;  // "last seen" working image (128×112 2bpp, 0xE00 bytes)
+  const STATE_VECTOR_OFFSET = 0x11B2;  // 30 bytes: album position per slot, 0xFF = deleted/unused
+  const THUMB_OFFSET        = 0xE00;   // per-slot thumbnail (256 bytes = 16 tiles)
+  const META_OFFSET         = 0xF00;   // per-slot metadata / camera settings (256 bytes)
+
   // ── Tile decoder ──────────────────────────────────────────────────────────
   //
   // Game Boy 2bpp tile layout (16 bytes per 8×8 tile):
@@ -66,8 +72,7 @@ window.GBCam = (() => {
   // Returns a Uint8Array of length PHOTO_WIDTH × PHOTO_HEIGHT
   // where each value is 0–3 (the color index, not yet mapped to a palette).
 
-  function decodePhoto(sav, photoIndex) {
-    const photoOffset = PHOTO_DATA_OFFSET + photoIndex * SLOT_SIZE;
+  function decodePhotoAt(sav, photoOffset) {
     const pixels = new Uint8Array(PHOTO_WIDTH * PHOTO_HEIGHT);
 
     for (let tileRow = 0; tileRow < TILES_TALL; tileRow++) {
@@ -89,19 +94,122 @@ window.GBCam = (() => {
     return pixels;
   }
 
+  function decodePhoto(sav, photoIndex) {
+    return decodePhotoAt(sav, PHOTO_DATA_OFFSET + photoIndex * SLOT_SIZE);
+  }
+
+  // ── Tile encoder (inverse of decodeTile) ─────────────────────────────────
+  //
+  // Writes pixel indices (0–3) from a PHOTO_WIDTH×PHOTO_HEIGHT array into the
+  // 2bpp tile layout at the given SRAM offset.
+
+  function encodePhotoAt(sav, photoOffset, pixels) {
+    for (let tileRow = 0; tileRow < TILES_TALL; tileRow++) {
+      for (let tileCol = 0; tileCol < TILES_WIDE; tileCol++) {
+        const tileOffset = photoOffset + (tileRow * TILES_WIDE + tileCol) * BYTES_PER_TILE;
+        for (let row = 0; row < 8; row++) {
+          let lo = 0, hi = 0;
+          for (let col = 0; col < 8; col++) {
+            const v = pixels[(tileRow * 8 + row) * PHOTO_WIDTH + tileCol * 8 + col] & 3;
+            const bit = 7 - col;
+            lo |= (v & 1) << bit;
+            hi |= ((v >> 1) & 1) << bit;
+          }
+          sav[tileOffset + row * 2]     = lo;
+          sav[tileOffset + row * 2 + 1] = hi;
+        }
+      }
+    }
+  }
+
+  /**
+   * Write an imported photo (pixel indices 0–3, 128×112) into a slot:
+   *  - image tiles at the slot base
+   *  - a 32×32 thumbnail (4×4 tiles) into the thumbnail region
+   *  - metadata copied from donorSlot (keeps a self-consistent metadata+checksum
+   *    block, the same trick community injectors use), or zeroed if none
+   *  - state vector entry set to albumPos (when the vector is valid)
+   */
+  function writePhotoToSlot(sav, slotIndex, pixels, { donorSlot = null, albumPos = null } = {}) {
+    const base = PHOTO_DATA_OFFSET + slotIndex * SLOT_SIZE;
+    encodePhotoAt(sav, base, pixels);
+
+    // Thumbnail: nearest-neighbour downscale to 32×32, encoded as 4×4 tiles
+    const THUMB_TILES = 4;
+    const TS = THUMB_TILES * TILE_PX; // 32
+    for (let tr = 0; tr < THUMB_TILES; tr++) {
+      for (let tc = 0; tc < THUMB_TILES; tc++) {
+        const tileOffset = base + THUMB_OFFSET + (tr * THUMB_TILES + tc) * BYTES_PER_TILE;
+        for (let row = 0; row < 8; row++) {
+          let lo = 0, hi = 0;
+          for (let col = 0; col < 8; col++) {
+            const sx = Math.min(PHOTO_WIDTH  - 1, Math.floor((tc * 8 + col) * PHOTO_WIDTH  / TS));
+            const sy = Math.min(PHOTO_HEIGHT - 1, Math.floor((tr * 8 + row) * PHOTO_HEIGHT / TS));
+            const v = pixels[sy * PHOTO_WIDTH + sx] & 3;
+            const bit = 7 - col;
+            lo |= (v & 1) << bit;
+            hi |= ((v >> 1) & 1) << bit;
+          }
+          sav[tileOffset + row * 2]     = lo;
+          sav[tileOffset + row * 2 + 1] = hi;
+        }
+      }
+    }
+
+    // Metadata: copy from donor slot so checksums stay internally consistent
+    if (donorSlot !== null && donorSlot !== slotIndex) {
+      const donorBase = PHOTO_DATA_OFFSET + donorSlot * SLOT_SIZE;
+      for (let i = 0; i < 256; i++) sav[base + META_OFFSET + i] = sav[donorBase + META_OFFSET + i];
+    }
+
+    // State vector: mark the slot used at the requested album position
+    if (albumPos !== null && readStateVector(sav)) {
+      sav[STATE_VECTOR_OFFSET + slotIndex] = albumPos & 0xFF;
+    }
+  }
+
   // ── Empty slot detection ───────────────────────────────────────────────────
   //
   // Heuristic: if >96% of the photo bytes are a single value (all 0x00 or all 0xFF),
-  // the slot is considered empty. Real photos always have a mix of the 4 shades.
+  // the region is considered blank. Real photos almost always mix the 4 shades —
+  // but a very bright / very dark photo CAN trip this, which is why parseSav
+  // prefers the bank-0 state vector when it's valid (see readStateVector).
 
-  function isPhotoEmpty(sav, photoIndex) {
-    const offset = PHOTO_DATA_OFFSET + photoIndex * SLOT_SIZE;
+  function isRegionBlank(sav, offset) {
     const freq = new Uint32Array(256);
     for (let i = 0; i < BYTES_PER_PHOTO; i++) {
       freq[sav[offset + i]]++;
     }
     const dominant = Math.max(...freq);
     return dominant / BYTES_PER_PHOTO > 0.96;
+  }
+
+  function isPhotoEmpty(sav, photoIndex) {
+    return isRegionBlank(sav, PHOTO_DATA_OFFSET + photoIndex * SLOT_SIZE);
+  }
+
+  // ── Bank 0: album state vector ─────────────────────────────────────────────
+  //
+  // 30 bytes at 0x11B2 — one per slot. Value 0x00–0x1D is the photo's position
+  // in the in-camera album; 0xFF means the slot is deleted (or never used).
+  // A deleted photo's tile data survives until the camera overwrites the slot,
+  // which is what makes deleted-photo recovery possible.
+  //
+  // Returns the 30-entry vector as a plain array, or null if the region doesn't
+  // look like a valid vector (all album positions must be unique and < 30).
+
+  function readStateVector(sav) {
+    if (!sav || sav.length < STATE_VECTOR_OFFSET + PHOTO_COUNT) return null;
+    const vec = [];
+    const seen = new Set();
+    for (let i = 0; i < PHOTO_COUNT; i++) {
+      const b = sav[STATE_VECTOR_OFFSET + i];
+      if (b === 0xFF) { vec.push(0xFF); continue; }
+      if (b >= PHOTO_COUNT || seen.has(b)) return null; // not a valid vector
+      seen.add(b);
+      vec.push(b);
+    }
+    return vec;
   }
 
   // ── Palette application ────────────────────────────────────────────────────
@@ -151,15 +259,43 @@ window.GBCam = (() => {
       console.warn(`[GBCam] Unexpected SRAM size: ${sav.length} (expected ${SRAM_SIZE})`);
     }
 
+    // Prefer the bank-0 album vector: it knows the true in-camera state, so a
+    // very bright/dark photo can't be misdetected as empty, deleted-but-intact
+    // photos become recoverable, and the album display order is preserved.
+    const vector = readStateVector(sav);
+
     const photos = [];
     for (let i = 0; i < PHOTO_COUNT; i++) {
-      const empty  = isPhotoEmpty(sav, i);
-      const pixels = empty ? null : decodePhoto(sav, i);
-      photos.push({ index: i, pixels, isEmpty: empty });
+      const blank = isPhotoEmpty(sav, i);
+      let isEmpty, isDeleted = false, albumPos = null;
+
+      if (vector) {
+        const v = vector[i];
+        if (v !== 0xFF) {
+          isEmpty  = false;         // in the album — always show, even if "blank"-looking
+          albumPos = v;
+        } else {
+          isDeleted = !blank;       // deleted in-camera but tile data still intact
+          isEmpty   = blank;
+        }
+      } else {
+        isEmpty = blank;            // no valid vector — fall back to the heuristic
+      }
+
+      const pixels = (isEmpty) ? null : decodePhoto(sav, i);
+      photos.push({ index: i, pixels, isEmpty, isDeleted, albumPos });
     }
 
-    const activeCount = photos.filter(p => !p.isEmpty).length;
-    return { photos, activeCount, sav };
+    // Hidden "last seen" image at the very start of SRAM — the working image
+    // shown on the camera's "check the last photo" screen.
+    let lastSeen = null;
+    if (!isRegionBlank(sav, LAST_SEEN_OFFSET)) {
+      lastSeen = decodePhotoAt(sav, LAST_SEEN_OFFSET);
+    }
+
+    const activeCount  = photos.filter(p => !p.isEmpty && !p.isDeleted).length;
+    const deletedCount = photos.filter(p => p.isDeleted).length;
+    return { photos, activeCount, deletedCount, lastSeen, hasVector: !!vector, sav };
   }
 
   // ── First non-empty photo decoder ─────────────────────────────────────────
@@ -184,5 +320,7 @@ window.GBCam = (() => {
     decodePhoto,
     decodeFirstPhoto,
     renderToCanvas,
+    readStateVector,
+    writePhotoToSlot,
   };
 })();

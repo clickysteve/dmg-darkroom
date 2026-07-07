@@ -7,14 +7,15 @@
     "start": "electron .",
     "build:mac": "electron-builder --mac",
     "build:win": "electron-builder --win",
-    "build:linux": "electron-builder --linux"
+    "build:linux": "electron-builder --linux",
+    "sync:web": "bash tools/sync-web.sh"
   },
   "dependencies": {
     "omggif": "^1.0.10"
   },
   "devDependencies": {
-    "electron": "^30.0.0",
-    "electron-builder": "^24.13.3"
+    "electron": "^42.5.2",
+    "electron-builder": "^26.0.12"
   },
   "build": {
     "appId": "com.clickysteve.dmgdarkroom",

@@ -397,6 +397,26 @@ html, body {
 .photo-slot.selected .slot-num,
 .photo-slot:hover .slot-num { color: rgba(255,255,255,0.6); }
 
+/* Recovered (deleted in-camera but data intact) photos */
+.photo-slot.deleted { opacity: 0.85; }
+.photo-slot .slot-flag {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  font-size: 8px;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #e8b23f;
+  background: rgba(0,0,0,0.55);
+  border: 1px solid rgba(232,178,63,0.4);
+  border-radius: 3px;
+  padding: 1px 4px;
+  line-height: 1.2;
+  pointer-events: none;
+  z-index: 2;
+}
+
 /* Empty slot placeholder */
 .empty-placeholder {
   position: absolute;

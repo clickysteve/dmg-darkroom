@@ -765,10 +765,14 @@ async function loadSavFile(result) {
   }
 
   const { buffer, name, path: filePath } = result;
-  const { photos, activeCount, sav } = GBCam.parseSav(buffer);
+  const { photos, activeCount, deletedCount, lastSeen, sav } = GBCam.parseSav(buffer);
 
   state.sav = sav;
   state.photos = photos;
+  // Hidden "last seen" working image from bank 0 — shown as an extra pseudo-slot
+  if (lastSeen) {
+    state.photos.push({ index: 30, pixels: lastSeen, isEmpty: false, isDeleted: false, albumPos: null, isLastSeen: true });
+  }
   state.activeCount = activeCount;
   state.filename = name;
   state.filePath = filePath || null;
@@ -777,12 +781,16 @@ async function loadSavFile(result) {
   state.gifSelection.clear();
   state.photoTransforms = {}; // reset transforms on new file load
   state.photoSettings   = {}; // reset per-photo overrides on new file load
+  clearThumbCache();
   if (filePath) saveLastSavPath(filePath);
 
   renderGrid();
   showMainView();
   updateExportSelectedBtn();
-  setStatus(`${name} — ${activeCount} photo${activeCount !== 1 ? 's' : ''} found`, true);
+  const extras = [];
+  if (deletedCount) extras.push(`${deletedCount} deleted recovered`);
+  if (lastSeen)     extras.push('last-seen image');
+  setStatus(`${name} — ${activeCount} photo${activeCount !== 1 ? 's' : ''} found${extras.length ? ` (+ ${extras.join(', ')})` : ''}`, true);
 }
 
 // ── Photo transforms ────────────────────────────────────────────────────────
@@ -866,6 +874,7 @@ function resetToWelcome() {
   state.gifFrameOrder = [];
   state.lightboxOpen = false;
   state.viewMode = 'grid';
+  clearThumbCache();
   // Return to welcome screen
   dom.main.style.display = 'none';
   dom.welcome.classList.remove('hidden');
@@ -874,21 +883,99 @@ function resetToWelcome() {
   if (dom.photoGrid) dom.photoGrid.innerHTML = '';
 }
 
+// ── Thumbnail render cache ──────────────────────────────────────────────────
+//
+// Grid repaints used to re-run the full composite → filters → tone pipeline
+// for all 30 thumbnails on every unrelated change. Cache the finished raster
+// per photo, keyed by a signature of everything that affects the output, and
+// only re-render when the signature changes.
+
+const _thumbCache = new Map(); // index → { sig, canvas }
+
+function clearThumbCache(index) {
+  if (index === undefined) _thumbCache.clear();
+  else _thumbCache.delete(index);
+}
+
+function _thumbSignature(eff, idx) {
+  return JSON.stringify([
+    THUMB_SCALE,
+    eff.palette?.id, eff.palette?.colors,
+    [...eff.activeFilters].sort(),
+    eff.filterParams, eff.filterIntensity, eff.filterVariant,
+    eff.brightness, eff.contrast, eff.toneIntensity,
+    eff.shadowColor, eff.highlightColor, eff.toneBalance,
+    eff.borderId, eff.borderEnabled, eff.filterScope,
+    state.photoTransforms[idx] || null,
+    state.filterOrder, state.sectionEnabled, state.effectsPreviewMode,
+  ]);
+}
+
+/** Render a photo thumbnail into `canvas`, reusing the cached raster when nothing changed. */
+function renderThumbCached(canvas, photo, eff, idx) {
+  const sig = _thumbSignature(eff, idx);
+  let entry = _thumbCache.get(idx);
+
+  if (!entry || entry.sig !== sig) {
+    const hasBorder = eff.borderEnabled && eff.borderId;
+    const off = document.createElement('canvas');
+    off.width  = (hasBorder ? 160 : GBCam.PHOTO_WIDTH)  * THUMB_SCALE;
+    off.height = (hasBorder ? 144 : GBCam.PHOTO_HEIGHT) * THUMB_SCALE;
+    const offCtx = off.getContext('2d', { willReadFrequently: true });
+    renderPhotoComplete(offCtx, photo, eff, THUMB_SCALE, idx, { thumbMode: true });
+    entry = { sig, canvas: off };
+    _thumbCache.set(idx, entry);
+  }
+
+  const src = entry.canvas;
+  if (canvas.width !== src.width || canvas.height !== src.height) {
+    canvas.width  = src.width;
+    canvas.height = src.height;
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(src, 0, 0);
+}
+
 // ── Grid ────────────────────────────────────────────────────────────────────
+
+/** Display ordering: album order (from the bank-0 vector) first, then
+ *  recovered deleted photos, then the last-seen image, then empty slots. */
+function gridDisplayRank(p) {
+  if (p.isLastSeen) return 2000;
+  if (p.isEmpty)    return 3000 + p.index;
+  if (p.isDeleted)  return 1000 + p.index;
+  return (p.albumPos !== null && p.albumPos !== undefined) ? p.albumPos : 500 + p.index;
+}
 
 function renderGrid() {
   dom.photoGrid.innerHTML = '';
 
-  for (const photo of state.photos) {
+  const displayPhotos = [...state.photos].sort((a, b) => gridDisplayRank(a) - gridDisplayRank(b));
+
+  for (const photo of displayPhotos) {
     const slot = document.createElement('div');
-    slot.className = 'photo-slot' + (photo.isEmpty ? ' empty' : '');
+    slot.className = 'photo-slot' + (photo.isEmpty ? ' empty' : '') + (photo.isDeleted ? ' deleted' : '');
     slot.dataset.index = photo.index;
 
     // Slot number badge
     const num = document.createElement('span');
     num.className = 'slot-num';
-    num.textContent = String(photo.index + 1).padStart(2, '0');
+    if (photo.isLastSeen) {
+      num.textContent = 'LS';
+      num.title = 'Hidden "last seen" image recovered from the start of SRAM';
+    } else {
+      num.textContent = String(photo.index + 1).padStart(2, '0');
+    }
     slot.appendChild(num);
+
+    if (photo.isDeleted) {
+      const flag = document.createElement('span');
+      flag.className = 'slot-flag';
+      flag.textContent = 'recovered';
+      flag.title = 'Deleted in-camera, but the photo data is still intact';
+      slot.appendChild(flag);
+    }
 
     if (photo.isEmpty) {
       const placeholder = document.createElement('div');
@@ -899,11 +986,7 @@ function renderGrid() {
       // Canvas thumbnail — rendered at THUMB_SCALE (4×) for filter clarity
       const canvas = document.createElement('canvas');
       const effThumb = getEffectiveSettings(photo.index);
-      const hasBorderThumb = effThumb.borderEnabled && effThumb.borderId;
-      canvas.width  = (hasBorderThumb ? 160 : GBCam.PHOTO_WIDTH)  * THUMB_SCALE;
-      canvas.height = (hasBorderThumb ? 144 : GBCam.PHOTO_HEIGHT) * THUMB_SCALE;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      renderPhotoComplete(ctx, photo, effThumb, THUMB_SCALE, photo.index, { thumbMode: true });
+      renderThumbCached(canvas, photo, effThumb, photo.index);
       slot.appendChild(canvas);
 
       // GIF selection (invisible div for event delegation; frame number via data attr)
@@ -1018,17 +1101,9 @@ function repaintGridSlot(index) {
   if (!slot) return;
   const canvas = slot.querySelector('canvas');
   if (!canvas) return;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
   const eff = getEffectiveSettings(index);
-  // Re-size canvas if needed (border state may have changed)
-  const hasBorderSlot = eff.borderEnabled && eff.borderId;
-  const expW = (hasBorderSlot ? 160 : GBCam.PHOTO_WIDTH)  * THUMB_SCALE;
-  const expH = (hasBorderSlot ? 144 : GBCam.PHOTO_HEIGHT) * THUMB_SCALE;
-  if (canvas.width !== expW || canvas.height !== expH) {
-    canvas.width  = expW;
-    canvas.height = expH;
-  }
-  renderPhotoComplete(ctx, photo, eff, THUMB_SCALE, index, { thumbMode: true });
+  // Cached render — re-runs the filter pipeline only when settings changed
+  renderThumbCached(canvas, photo, eff, index);
   // Slot badge — photo-specific settings override indicator
   slot.classList.toggle('has-photo-settings', hasPhotoOverride(index));
 }
@@ -1370,13 +1445,13 @@ async function exportSinglePng() {
     : state.exportScale;
 
   const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
   const effExp = getEffectiveSettings(index);
   renderPhotoComplete(ctx, photo, effExp, scale, index, { forExport: true });
 
   const dataUrl = canvas.toDataURL('image/png');
   const filterTag = effExp.activeFilters.size > 0 ? `_${[...effExp.activeFilters].join('+')}` : '';
-  const scaleTag = state.exportScale === 'custom' ? `${width}px` : `${state.exportScale}x`;
+  const scaleTag = state.exportScale === 'custom' ? `${getExportDimensions().width}px` : `${state.exportScale}x`;
   const defaultName = `gbcam_${String(index + 1).padStart(2, '0')}_${effExp.palette.id}_${scaleTag}${filterTag}.png`;
 
   const saved = await window.api.savePng(dataUrl, defaultName);
@@ -1397,7 +1472,7 @@ async function exportBatchPng() {
 
   for (const photo of photos) {
     const canvas = document.createElement('canvas');
-    const ctx    = canvas.getContext('2d');
+    const ctx    = canvas.getContext('2d', { willReadFrequently: true });
     const effBatch = getEffectiveSettings(photo.index);
     renderPhotoComplete(ctx, photo, effBatch, batchScale, photo.index, { forExport: true });
     const dataUrl = canvas.toDataURL('image/png');
@@ -1422,10 +1497,7 @@ function enterGifMode() {
 }
 
 function exitGifMode() {
-  if (state.gifPreviewTimer) {
-    clearInterval(state.gifPreviewTimer);
-    state.gifPreviewTimer = null;
-  }
+  stopGifPreviewLoop();
   state.gifMode = false;
   state.gifSelection.clear();
   state.gifFrameOrder = [];
@@ -1684,7 +1756,7 @@ function setGifLoop(mode) {
 
 /**
  * Render one GIF frame (photo + optional border) onto ctx.canvas at the given scale.
- * When includeBorders is on, every frame is rendered at 160x144 (native) so all GIF
+ * When includeBorders is on, every frame is rendered at 160×144 (native) so all GIF
  * frames share dimensions: photos with a border get the colorised frame, photos without
  * one are centred on the darkest palette colour. Returns native (unscaled) { width, height }.
  */
@@ -1790,13 +1862,19 @@ async function exportGif() {
     const loopTag = state.gifLoop !== 'infinite' ? `_${state.gifLoop}` : '';
     const defaultName = `darkroom_anim_${scale}x${loopTag}.gif`;
 
-    const result = await window.api.saveGif({
-      frames,
-      delay:  state.gifDelay,
-      scale,
-      loop:   state.gifLoop,   // 'infinite' | 'once' | 'bounce'
-      defaultName,
-    });
+    const prevStatus = dom.statusText.textContent;
+    let result;
+    try {
+      result = await window.api.saveGif({
+        frames,
+        delay:  state.gifDelay,
+        scale,
+        loop:   state.gifLoop,   // 'infinite' | 'once' | 'bounce'
+        defaultName,
+      });
+    } finally {
+      setStatus(prevStatus, true);
+    }
 
     if (!result) return; // user canceled save dialog
     if (result.error) { showToast(`GIF error: ${result.error}`); return; }
@@ -1924,9 +2002,12 @@ function setupDragDrop() {
     const file = e.dataTransfer.files[0];
     if (!file) return;
 
-    if (window.api?.readFile && file.path) {
+    // Electron: resolve the dropped File to a native path (File.path was
+    // removed in Electron 32; webUtils.getPathForFile is the supported API).
+    const nativePath = window.api?.getPathForFile ? window.api.getPathForFile(file) : (file.path || null);
+    if (window.api?.readFile && nativePath) {
       // Electron: use native path for proper size validation in main process
-      const result = await window.api.readFile(file.path);
+      const result = await window.api.readFile(nativePath);
       await loadSavFile(result);
     } else {
       // Web / fallback
@@ -3208,12 +3289,38 @@ function updateGifFrameNumbers() {
 }
 
 // ── GIF live preview in detail panel ──────────────────────────────────────
+//
+// Driven by requestAnimationFrame (timestamp-gated to gifDelay) instead of
+// setInterval — rAF stops firing in hidden/background windows, so the preview
+// no longer burns CPU when the app isn't visible.
 
-function updateGifPreview() {
-  if (state.gifPreviewTimer) {
+let _gifPreviewRAF = null;
+
+function stopGifPreviewLoop() {
+  if (_gifPreviewRAF !== null) {
+    cancelAnimationFrame(_gifPreviewRAF);
+    _gifPreviewRAF = null;
+  }
+  if (state.gifPreviewTimer) { // legacy interval handle, just in case
     clearInterval(state.gifPreviewTimer);
     state.gifPreviewTimer = null;
   }
+}
+
+function startGifPreviewLoop(tick) {
+  let last = performance.now();
+  const loop = (now) => {
+    _gifPreviewRAF = requestAnimationFrame(loop);
+    if (now - last >= state.gifDelay) {
+      last = now;
+      tick();
+    }
+  };
+  _gifPreviewRAF = requestAnimationFrame(loop);
+}
+
+function updateGifPreview() {
+  stopGifPreviewLoop();
 
   const baseFrames = state.gifFrameOrder;
 
@@ -3251,7 +3358,7 @@ function updateGifPreview() {
     const effGif = getEffectiveSettings(frameObj.photoIndex);
     const pal = frameObj.paletteId ? PALETTES[frameObj.paletteId] : effGif.palette;
     // Renders bare photo, or photo + border when the GIF "Borders" toggle is on.
-    // Sets canvas.width/height itself (128x112 or 160x144, scaled).
+    // Sets canvas.width/height itself (128×112 or 160×144, scaled).
     renderGifFrameToCanvas(frameCtx, photo, effGif, pal, frameObj.photoIndex, PREVIEW_SCALE, state.gifBorders);
     if (effGif.activeFilters.size > 0) {
       applyActiveEffects(frameCtx, canvas.width, canvas.height, PREVIEW_SCALE,
@@ -3269,7 +3376,7 @@ function updateGifPreview() {
 
   showFrame(); // render first frame immediately
   if (frames.length > 1) {
-    state.gifPreviewTimer = setInterval(showFrame, state.gifDelay);
+    startGifPreviewLoop(showFrame);
   }
 }
 
@@ -4810,6 +4917,142 @@ async function exportSav() {
   if (result) showToast(`Saved: ${result}`);
 }
 
+// ── Import: image → .sav slot ───────────────────────────────────────────────
+//
+// Takes any image, cover-crops it to 128×112, converts to 4 grey levels with
+// ordered (Bayer 4×4) dithering, and writes it into the first empty photo slot
+// — tiles, thumbnail, metadata (copied from a donor slot so checksums stay
+// consistent) and the bank-0 album vector. Export .sav afterwards to keep it.
+
+const _BAYER4 = [
+  [ 0,  8,  2, 10],
+  [12,  4, 14,  6],
+  [ 3, 11,  1,  9],
+  [15,  7, 13,  5],
+];
+
+/** Convert an ImageData (128×112) to GB Camera pixel indices (0 = lightest … 3 = darkest). */
+function ditherImageDataToIndices(imageData) {
+  const { data, width, height } = imageData;
+  const n = width * height;
+
+  // Luminance
+  const lum = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    lum[i] = (0.2126 * data[i * 4] + 0.7152 * data[i * 4 + 1] + 0.0722 * data[i * 4 + 2]) / 255;
+  }
+
+  // Auto-contrast: stretch 2nd–98th percentile to full range
+  const sorted = Float32Array.from(lum).sort();
+  const lo = sorted[Math.floor(n * 0.02)];
+  const hi = sorted[Math.min(n - 1, Math.floor(n * 0.98))];
+  const range = Math.max(1e-6, hi - lo);
+
+  const indices = new Uint8Array(n);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      const v = Math.min(1, Math.max(0, (lum[i] - lo) / range));
+      // Ordered dithering between the two adjacent quantisation levels
+      const t = (_BAYER4[y & 3][x & 3] + 0.5) / 16;
+      const q = v * 3;
+      const base = Math.floor(q);
+      const level = Math.min(3, base + ((q - base) > t ? 1 : 0));
+      indices[i] = 3 - level; // level 3 = lightest → colour index 0
+    }
+  }
+  return indices;
+}
+
+/** Draw an image cover-cropped into a 128×112 canvas and return its ImageData. */
+function imageToPhotoImageData(img) {
+  const W = GBCam.PHOTO_WIDTH, H = GBCam.PHOTO_HEIGHT;
+  const canvas = Object.assign(document.createElement('canvas'), { width: W, height: H });
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const srcW = img.naturalWidth || img.width;
+  const srcH = img.naturalHeight || img.height;
+  const scale = Math.max(W / srcW, H / srcH);
+  const dw = srcW * scale, dh = srcH * scale;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, (W - dw) / 2, (H - dh) / 2, dw, dh);
+  return ctx.getImageData(0, 0, W, H);
+}
+
+async function importImageToSlot(file) {
+  if (!state.sav) { showToast('Load a .sav first'); return; }
+
+  // Real camera slots only (0–29); the last-seen pseudo-slot can't be written.
+  // Prefer a truly empty slot; fall back to a deleted slot (the camera itself
+  // would overwrite those) after confirming, since that data is recoverable.
+  let slot = state.photos.find(p => p.index < GBCam.PHOTO_COUNT && p.isEmpty)?.index;
+  if (slot === undefined) {
+    const deleted = state.photos.find(p => p.index < GBCam.PHOTO_COUNT && p.isDeleted)?.index;
+    if (deleted === undefined) {
+      showToast('No free slots — this save is full');
+      return;
+    }
+    const ok = window.confirm(
+      `No empty slots. Overwrite slot ${String(deleted + 1).padStart(2, '0')}?\n\n` +
+      'That slot holds a photo deleted in-camera (currently shown as "recovered"). ' +
+      'Importing over it will destroy that photo permanently.'
+    );
+    if (!ok) return;
+    slot = deleted;
+  }
+
+  let img;
+  const url = URL.createObjectURL(file);
+  try {
+    img = await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload  = () => resolve(image);
+      image.onerror = () => reject(new Error('Could not read image'));
+      image.src = url;
+    });
+  } catch (e) {
+    URL.revokeObjectURL(url);
+    showToast(`⚠ ${e.message}`);
+    return;
+  }
+  URL.revokeObjectURL(url);
+
+  const indices = ditherImageDataToIndices(imageToPhotoImageData(img));
+
+  // Donor slot for metadata (keeps a valid metadata+checksum block); next album position
+  const donor = state.photos.find(p => p.index < GBCam.PHOTO_COUNT && !p.isEmpty && !p.isDeleted && !p.isLastSeen)?.index ?? null;
+  const usedPositions = state.photos.map(p => p.albumPos).filter(v => v !== null && v !== undefined);
+  const albumPos = usedPositions.length ? Math.max(...usedPositions) + 1 : 0;
+
+  GBCam.writePhotoToSlot(state.sav, slot, indices, { donorSlot: donor, albumPos });
+
+  // Update in-memory photo + repaint
+  const photo = state.photos.find(p => p.index === slot);
+  photo.pixels    = indices;
+  photo.isEmpty   = false;
+  photo.isDeleted = false;
+  photo.albumPos  = albumPos;
+  state.activeCount++;
+  clearThumbCache(slot);
+  renderGrid();
+  showToast(`Imported into slot ${String(slot + 1).padStart(2, '0')} — use Export .sav to keep it`);
+}
+
+function setupImageImport() {
+  const btn = document.getElementById('btn-import-image');
+  if (!btn) return;
+  const input = Object.assign(document.createElement('input'), {
+    type: 'file',
+    accept: 'image/*',
+  });
+  input.addEventListener('change', async () => {
+    const file = input.files[0];
+    input.value = '';
+    if (file) await importImageToSlot(file);
+  });
+  btn.addEventListener('click', () => input.click());
+}
+
 // ── Project file (.gbcp) ────────────────────────────────────────────────────
 
 function buildProjectJson() {
@@ -4843,6 +5086,11 @@ function buildProjectJson() {
       gifDelay:        state.gifDelay,
       gifLoop:         state.gifLoop,
       gifBorders:      state.gifBorders,
+      activeFilters:   [...state.activeFilters],
+      sectionEnabled:  state.sectionEnabled,
+      borderId:        state.borderId,
+      borderEnabled:   state.borderEnabled,
+      filterScope:     state.filterScope,
       photoSettings:   state.photoSettings,
       photoTransforms: state.photoTransforms,
       filterOrder:     state.filterOrder,
@@ -4920,6 +5168,27 @@ async function openProject() {
     }
   }
 
+  // Restore global editing state (added in v1.3 — older projects simply skip these)
+  if (Array.isArray(s.activeFilters)) state.activeFilters = new Set(s.activeFilters);
+  if (s.sectionEnabled && typeof s.sectionEnabled === 'object') {
+    state.sectionEnabled = { ...state.sectionEnabled, ...s.sectionEnabled };
+    document.querySelectorAll('.section-check[data-section]').forEach(cb => {
+      if (cb.dataset.section in state.sectionEnabled) cb.checked = !!state.sectionEnabled[cb.dataset.section];
+    });
+  }
+  if (typeof s.borderId === 'string')       state.borderId      = s.borderId;
+  if (typeof s.borderEnabled === 'boolean') state.borderEnabled = s.borderEnabled;
+  const projBorderCb = document.getElementById('border-enabled-check');
+  if (projBorderCb) projBorderCb.checked = state.borderEnabled;
+  document.querySelectorAll('.border-frame-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.frameId === state.borderId);
+  });
+  if (s.filterScope === 'full' || s.filterScope === 'photo') {
+    state.filterScope = s.filterScope;
+    const scopeCb = document.getElementById('filter-scope-check');
+    if (scopeCb) scopeCb.checked = state.filterScope === 'full';
+  }
+
   // Restore filter order (and reorder accordion DOM to match)
   if (Array.isArray(s.filterOrder) && s.filterOrder.length > 0) {
     state.filterOrder = s.filterOrder;
@@ -4954,6 +5223,10 @@ async function openProject() {
     renderFavPalettes();
   }
 
+  // Repaint with the fully-restored global state (filters, borders, sections)
+  updateFilterUI();
+  repaintGrid();
+
   showToast(`Project loaded: ${result.name}`);
 }
 
@@ -4984,45 +5257,6 @@ async function reloadSav() {
     ? await window.api.readFile(p)
     : null;
   if (result) await loadSavFile(result);
-}
-
-// ── Drag and drop .sav ────────────────────────────────────────────────────────
-
-function setupDragDropSav() {
-  const appEl = dom.app || document.getElementById('app');
-  if (!appEl) return;
-
-  appEl.addEventListener('dragover', e => {
-    const hasSav = Array.from(e.dataTransfer.items || [])
-      .some(item => item.kind === 'file');
-    if (!hasSav) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'copy';
-    dom.dropOverlay?.classList.remove('hidden');
-  });
-
-  appEl.addEventListener('dragleave', e => {
-    if (!appEl.contains(e.relatedTarget)) {
-      dom.dropOverlay?.classList.add('hidden');
-    }
-  });
-
-  appEl.addEventListener('drop', async e => {
-    e.preventDefault();
-    dom.dropOverlay?.classList.add('hidden');
-    const file = e.dataTransfer.files[0];
-    if (!file) return;
-
-    if (window.api?.readFile && file.path) {
-      // Electron: use native path
-      const result = await window.api.readFile(file.path);
-      await loadSavFile(result);
-    } else {
-      // Web: read via FileReader
-      const buf = await file.arrayBuffer();
-      await loadSavFile({ buffer: buf, name: file.name, path: null });
-    }
-  });
 }
 
 // ── Fullscreen presentation mode ──────────────────────────────────────────────
@@ -5115,7 +5349,7 @@ async function exportContactSheet() {
 
     // Render photo (with border if any) + filters + tone
     const tmp  = document.createElement('canvas');
-    const tctx = tmp.getContext('2d');
+    const tctx = tmp.getContext('2d', { willReadFrequently: true });
     const effSheet = getEffectiveSettings(photo.index);
     renderPhotoComplete(tctx, photo, effSheet, SHEET_SCALE, photo.index, { forExport: true });
 
@@ -6476,6 +6710,11 @@ function init() {
   setupFilterAccordion();
   preloadBorderImages();
   setupBorderPicker();
+  setupImageImport();
+  // GIF encode progress (from the encoder worker/main process)
+  window.api?.onGifProgress?.((p) => {
+    if (typeof p === 'number') setStatus(`Encoding GIF… ${Math.round(p * 100)}%`, true);
+  });
   setStatus('No file loaded');
   setExportScale(20);
   setThumbnailSize(120); // default: ~120px thumbnails (auto-fill)

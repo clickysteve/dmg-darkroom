@@ -7,10 +7,26 @@
  * Browser feature notes:
  *  - File System Access API (showOpenFilePicker, showDirectoryPicker):
  *    Chrome 86+, Edge 86+. Falls back to <input type=file> on Firefox/Safari.
- *  - GIF export: loads gifenc from jsDelivr CDN on demand. Requires internet.
- *  - Batch PNG export: zips via JSZip from CDN, or downloads sequentially.
+ *  - GIF export: encoded in a Web Worker (js/gif-worker.js), gifenc bundled locally.
+ *  - Batch PNG export: zips via JSZip (bundled locally), or downloads sequentially.
  *  - Analogue Pocket detection: user picks the SD card folder via directory picker.
+ *  - Installable PWA: service worker (sw.js) caches the app shell for offline use.
  */
+
+// ── Service worker (PWA / offline support) ──────────────────────────────────
+
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  });
+}
+
+// ── GIF encode progress listeners ────────────────────────────────────────────
+
+const _gifProgressCbs = [];
+function _emitGifProgress(p) {
+  for (const cb of _gifProgressCbs) { try { cb(p); } catch (_) {} }
+}
 
 // ── Scale helper (shared with GIF encoding) ─────────────────────────────────
 
@@ -150,7 +166,8 @@ window.api = {
   // ── Save PNG batch (zip) ───────────────────────────────────────────────────
   savePngBatch: async (photos) => {
     try {
-      const { default: JSZip } = await import('https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm');
+      // JSZip bundled locally — works offline
+      const { default: JSZip } = await import('./jszip.esm.js');
       const zip = new JSZip();
       for (const { dataUrl, name } of photos) {
         zip.file(name, dataUrl.split(',')[1], { base64: true });
@@ -171,35 +188,48 @@ window.api = {
   },
 
   // ── Save animated GIF ──────────────────────────────────────────────────────
+  // Encoded in a Web Worker so the UI thread stays responsive; falls back to
+  // inline encoding if module workers aren't available.
   saveGif: async (options) => {
     const { frames, delay, scale, loop, defaultName } = options;
-    const w = frames[0].width * scale;
-    const h = frames[0].height * scale;
-    // gifenc expects delay in milliseconds (unlike omggif which uses centiseconds).
-    // For looping GIFs, pass repeat:0 (infinite) on the FIRST frame only — this writes
-    // the Netscape Application Block. For "once", omit repeat entirely (no NAB = play once).
 
     let bytes;
     try {
-      // gifenc bundled locally — no network dependency
+      bytes = await new Promise((resolve, reject) => {
+        let worker;
+        try {
+          worker = new Worker('./js/gif-worker.js', { type: 'module' });
+        } catch (e) { return reject(e); }
+        worker.onmessage = (e) => {
+          const m = e.data || {};
+          if (typeof m.progress === 'number') { _emitGifProgress(m.progress); return; }
+          worker.terminate();
+          if (m.done) resolve(new Uint8Array(m.buffer));
+          else reject(new Error(m.error || 'GIF encoding failed'));
+        };
+        worker.onerror = (e) => {
+          worker.terminate();
+          reject(new Error(e.message || 'GIF worker failed'));
+        };
+        worker.postMessage(options);
+      });
+    } catch (_) {
+      // Fallback: encode inline on the main thread
+      const w = frames[0].width * scale;
+      const h = frames[0].height * scale;
       const { GIFEncoder } = await import('./gifenc.esm.js');
       const gif = GIFEncoder();
-
       for (let fi = 0; fi < frames.length; fi++) {
         const frame = frames[fi];
         const scaled = scaleIndicesWeb(new Uint8Array(frame.indices), frame.width, frame.height, scale);
-        const opts = {
-          palette: frame.palette, // [[r,g,b], ...]
-          delay,   // ms — gifenc expects milliseconds directly
-        };
-        // Only write the Netscape loop block on the first frame, and only when looping
+        const opts = { palette: frame.palette, delay }; // gifenc: delay in ms
         if (fi === 0 && loop !== 'once') opts.repeat = 0;
         gif.writeFrame(scaled, w, h, opts);
       }
       gif.finish();
       bytes = gif.bytes();
-    } catch (e) {
-      throw new Error(`GIF export requires an internet connection to load the encoder. (${e.message})`);
+    } finally {
+      _emitGifProgress(null);
     }
 
     const blob = new Blob([bytes], { type: 'image/gif' });
@@ -208,6 +238,12 @@ window.api = {
     setTimeout(() => URL.revokeObjectURL(url), 5000);
     return defaultName;
   },
+
+  // ── GIF encode progress (0–1, or null when finished) ───────────────────────
+  onGifProgress: (cb) => { _gifProgressCbs.push(cb); },
+
+  // ── Dropped-file native path (Electron only — no paths on the web) ─────────
+  getPathForFile: () => null,
 
   // ── Fetch JSON (for Lospec palette import) ─────────────────────────────────
   fetchJson: async (url) => {
