@@ -17,6 +17,7 @@
 
 **Effects & tone**
 - CRT, LCD grid, halftone, dot matrix, phosphor glow, chromatic aberration, vignette, noise/static, VHS ghosting, and scanline jitter — each with granular per-filter controls
+- GB Printer thermal-paper emulation, cart-corruption tile glitch, photocopied-zine look, and Bayer / Floyd–Steinberg / Atkinson dithering
 - Brightness, contrast, and split toning (shadow/highlight colour with intensity and balance)
 
 **Border frames**
@@ -47,8 +48,9 @@
 - Hidden "last seen" image from the start of SRAM shown as an extra slot (LS)
 - Photo metadata decoded from the save: photographer name, gender, birthdate, comment, and link-cable copy flag (shown in solo view and lightbox)
 
-**Import**
-- Import any image into an empty photo slot — cover-cropped to 128×112 and dithered to 4 shades (Bayer ordered dithering), written back with thumbnail, metadata, and album entry
+**Import & blend**
+- Import any image into an empty photo slot — cover-cropped to 128×112 and dithered to 4 shades (choice of Bayer, Floyd–Steinberg, or Atkinson), written back with thumbnail, metadata, and album entry
+- Blend two photos into a new slot — double-exposure average, darken, lighten, or difference
 - Export the modified `.sav` for use in emulators, flash carts, and other tools
 
 ---

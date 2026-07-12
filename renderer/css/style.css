@@ -397,6 +397,24 @@ html, body {
 .photo-slot.selected .slot-num,
 .photo-slot:hover .slot-num { color: rgba(255,255,255,0.6); }
 
+/* Anchored action popover (import dither choice, blend modes) —
+   same visuals as .overflow-dropdown but independent, because
+   setupOverflowMenus() force-hides that class on any document click */
+.action-popover {
+  position: fixed;
+  display: block;
+  z-index: 1000;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px;
+  min-width: 190px;
+  max-height: 320px;
+  overflow-y: auto;
+  box-shadow: 0 8px 28px rgba(0,0,0,0.55);
+  -webkit-app-region: no-drag;
+}
+
 /* Recovered (deleted in-camera but data intact) photos */
 .photo-slot.deleted { opacity: 0.85; }
 .photo-slot .slot-flag {

@@ -137,6 +137,7 @@ function init() {
   preloadBorderImages();
   setupBorderPicker();
   setupImageImport();
+  setupBlend();
   // GIF encode progress (from the encoder worker/main process)
   window.api?.onGifProgress?.((p) => {
     if (typeof p === 'number') setStatus(`Encoding GIF… ${Math.round(p * 100)}%`, true);

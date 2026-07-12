@@ -94,6 +94,25 @@ const FILTER_DEFS = [
     { type: 'range', key: 'density',   label: 'Density',          def: 35,  min: 1, max: 100, step: 1, fmt: v => `${v}%` },
     { type: 'range', key: 'strength',  label: 'Strength',         def: 65,  min: 1, max: 100, step: 1, fmt: v => `${v}%` },
   ]},
+  { id: 'printer',   label: 'GB Printer',           params: [
+    { type: 'range', key: 'banding',   label: 'Banding',          def: 40,  min: 0, max: 100, step: 1, fmt: v => `${v}%` },
+    { type: 'range', key: 'streaks',   label: 'Streaks',          def: 30,  min: 0, max: 100, step: 1, fmt: v => `${v}%` },
+    { type: 'range', key: 'fade',      label: 'Ink fade',         def: 30,  min: 0, max: 100, step: 1, fmt: v => `${v}%` },
+    { type: 'range', key: 'warmth',    label: 'Paper warmth',     def: 60,  min: 0, max: 100, step: 1, fmt: v => `${v}%` },
+  ]},
+  { id: 'tilecorrupt', label: 'Cart Corruption',    params: [
+    { type: 'range', key: 'amount',    label: 'Amount',           def: 20,  min: 1, max: 100, step: 1, fmt: v => `${v}%` },
+    { type: 'range', key: 'chaos',     label: 'Chaos',            def: 50,  min: 0, max: 100, step: 1, fmt: v => `${v}%` },
+    { type: 'range', key: 'seed',      label: 'Variation',        def: 1,   min: 1, max: 99,  step: 1, fmt: v => `#${v}` },
+  ]},
+  { id: 'zine',      label: 'Photocopy',            params: [
+    { type: 'range', key: 'crush',     label: 'Contrast crush',   def: 60,  min: 0, max: 100, step: 1, fmt: v => `${v}%` },
+    { type: 'range', key: 'toner',     label: 'Toner speckle',    def: 30,  min: 0, max: 100, step: 1, fmt: v => `${v}%` },
+    { type: 'range', key: 'streaks',   label: 'Roller streaks',   def: 25,  min: 0, max: 100, step: 1, fmt: v => `${v}%` },
+  ]},
+  { id: 'atkinson',  label: 'Atkinson Dither',      params: [
+    { type: 'range', key: 'levels',    label: 'Levels',           def: 2,   min: 2, max: 8,   step: 1, fmt: v => `${v}` },
+  ]},
 ];
 
 function buildDefaultFilterParams() {

@@ -1138,6 +1138,198 @@ function applyExportFilter(ctx, width, height, scale, filter,
     ctx.putImageData(new ImageData(out, width, height), 0, 0);
     return;
 
+  } else if (filter === 'printer') {
+    // ── GB Printer ─────────────────────────────────────────────────────────
+    // Thermal print emulation: off-white paper, ink density from luminance,
+    // horizontal banding per print-head pass, vertical streaks, ink fade.
+    const pBanding = ((filterParams.printer || {}).banding ?? 40) / 100;
+    const pStreaks = ((filterParams.printer || {}).streaks ?? 30) / 100;
+    const pFade    = ((filterParams.printer || {}).fade    ?? 30) / 100;
+    const pWarmth  = ((filterParams.printer || {}).warmth  ?? 60) / 100;
+
+    const src  = ctx.getImageData(0, 0, width, height);
+    const d    = src.data;
+    const orig = new Uint8ClampedArray(d);
+
+    // Thermal paper (warmer with the slider) and ink colours
+    const paper = [250, 247 - pWarmth * 7, 240 - pWarmth * 22];
+    const inkC  = [48, 44, 40];
+    const bandH = Math.max(2, Math.round(s * 2)); // one print-head pass ≈ 2 GB rows
+
+    // Per-column streak multipliers (stable per photo)
+    const colMul = new Float32Array(Math.ceil(width / Math.max(1, s)) + 1);
+    for (let c = 0; c < colMul.length; c++) {
+      colMul[c] = 1 - pStreaks * 0.28 * _seededRand(photoSeed, c * 13 + 5);
+    }
+
+    for (let y = 0; y < height; y++) {
+      const band    = Math.floor(y / bandH);
+      const bandMul = (1 - pBanding * 0.20 * _seededRand(photoSeed, band * 7 + 1))
+                    * (y % bandH === 0 ? 1 - pBanding * 0.22 : 1);
+      for (let x = 0; x < width; x++) {
+        const i = (y * width + x) * 4;
+        if (d[i + 3] === 0) continue;
+        const lum = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) / 255;
+        let density = (1 - lum) * (1 - pFade * 0.42) * bandMul * colMul[Math.floor(x / Math.max(1, s))];
+        density = Math.min(1, Math.max(0, density));
+        d[i]     = Math.round(paper[0] + (inkC[0] - paper[0]) * density);
+        d[i + 1] = Math.round(paper[1] + (inkC[1] - paper[1]) * density);
+        d[i + 2] = Math.round(paper[2] + (inkC[2] - paper[2]) * density);
+      }
+    }
+    const tpr = Math.min(1, Math.max(0, intensity));
+    if (tpr < 1) {
+      for (let i = 0; i < d.length; i += 4) {
+        d[i]   = Math.round(orig[i]   * (1 - tpr) + d[i]   * tpr);
+        d[i+1] = Math.round(orig[i+1] * (1 - tpr) + d[i+1] * tpr);
+        d[i+2] = Math.round(orig[i+2] * (1 - tpr) + d[i+2] * tpr);
+      }
+    }
+    ctx.putImageData(src, 0, 0);
+    return;
+
+  } else if (filter === 'tilecorrupt') {
+    // ── Cart Corruption ────────────────────────────────────────────────────
+    // Glitches at the Game Boy's native 8×8 tile granularity, the way a dying
+    // cartridge or bad dump actually corrupts: swapped tiles, stuttered
+    // repeats, and sheared tiles. Seeded, so stable across repaints.
+    const tcAmount = ((filterParams.tilecorrupt || {}).amount ?? 20) / 100;
+    const tcChaos  = ((filterParams.tilecorrupt || {}).chaos  ?? 50) / 100;
+    const tcSeed   = ((filterParams.tilecorrupt || {}).seed   ?? 1) * 131;
+
+    const T    = 8 * s; // one GB tile in screen pixels
+    const cols = Math.ceil(width / T);
+    const rows = Math.ceil(height / T);
+    const snap = Object.assign(document.createElement('canvas'), { width, height });
+    snap.getContext('2d').drawImage(ctx.canvas, 0, 0);
+
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, Math.max(0, intensity));
+    for (let ty = 0; ty < rows; ty++) {
+      for (let tx = 0; tx < cols; tx++) {
+        const ti = ty * cols + tx;
+        if (_seededRand(photoSeed + tcSeed, ti) > tcAmount * 0.5) continue;
+        const kind = _seededRand(photoSeed + tcSeed, ti * 3 + 1);
+        const dx = tx * T, dy = ty * T;
+        if (kind < 0.15 + tcChaos * 0.45) {
+          // Full tile swap — copy a random other tile here
+          const sx = Math.floor(_seededRand(tcSeed, ti * 5 + 2) * cols) * T;
+          const sy = Math.floor(_seededRand(tcSeed, ti * 5 + 3) * rows) * T;
+          ctx.drawImage(snap, sx, sy, T, T, dx, dy, T, T);
+        } else if (kind < 0.7) {
+          // Shear — tile sampled at a horizontal offset (bitplane-slip look)
+          const shift = Math.round((_seededRand(tcSeed, ti * 5 + 4) - 0.5) * s * 6);
+          ctx.drawImage(snap, dx - shift, dy, T, T, dx, dy, T, T);
+        } else {
+          // Stutter — repeat the tile to the left
+          ctx.drawImage(snap, Math.max(0, dx - T), dy, T, T, dx, dy, T, T);
+        }
+      }
+    }
+    ctx.restore();
+    return;
+
+  } else if (filter === 'zine') {
+    // ── Photocopy ──────────────────────────────────────────────────────────
+    // Nth-generation photocopied-zine look: crushed contrast through a
+    // sigmoid, toner speckle (dark specks in highlights, dropouts in
+    // shadows), and vertical roller streaks. Monochrome paper/toner output.
+    const znCrush   = ((filterParams.zine || {}).crush   ?? 60) / 100;
+    const znToner   = ((filterParams.zine || {}).toner   ?? 30) / 100;
+    const znStreaks = ((filterParams.zine || {}).streaks ?? 25) / 100;
+
+    const src  = ctx.getImageData(0, 0, width, height);
+    const d    = src.data;
+    const orig = new Uint8ClampedArray(d);
+
+    const k  = 2 + znCrush * 10; // sigmoid steepness
+    const lo = 1 / (1 + Math.exp(k * 0.55));
+    const hi = 1 / (1 + Math.exp(-k * 0.45));
+    const paperV = 248, tonerV = 22;
+    const gbW = Math.max(1, s);
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = (y * width + x) * 4;
+        if (d[i + 3] === 0) continue;
+        const lum = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) / 255;
+        // Contrast crush (normalised sigmoid around 0.55)
+        let v = (1 / (1 + Math.exp(-k * (lum - 0.55))) - lo) / (hi - lo);
+        // Roller streaks — vertical bands, 2 GB pixels wide
+        const band = Math.floor(x / (gbW * 2));
+        v += znStreaks * 0.18 * (_seededRand(photoSeed, band * 11 + 3) - 0.5) * 2;
+        // Toner speckle at GB-pixel granularity
+        const gx = Math.floor(x / gbW), gy = Math.floor(y / gbW);
+        const pr = _seededRand(photoSeed, gy * 521 + gx);
+        if (pr < znToner * 0.04) v += (v > 0.5 ? -0.7 : 0.7);
+        v = Math.min(1, Math.max(0, v));
+        const outV = Math.round(tonerV + (paperV - tonerV) * v);
+        d[i] = d[i + 1] = d[i + 2] = outV;
+      }
+    }
+    const tzn = Math.min(1, Math.max(0, intensity));
+    if (tzn < 1) {
+      for (let i = 0; i < d.length; i += 4) {
+        d[i]   = Math.round(orig[i]   * (1 - tzn) + d[i]   * tzn);
+        d[i+1] = Math.round(orig[i+1] * (1 - tzn) + d[i+1] * tzn);
+        d[i+2] = Math.round(orig[i+2] * (1 - tzn) + d[i+2] * tzn);
+      }
+    }
+    ctx.putImageData(src, 0, 0);
+    return;
+
+  } else if (filter === 'atkinson') {
+    // ── Atkinson Dithering ─────────────────────────────────────────────────
+    // Bill Atkinson's error-diffusion (classic Mac look): only 6/8 of the
+    // quantisation error is diffused, which blows out highlights and deepens
+    // shadows — arguably the best-looking dither for low-tone-count images.
+    const levels = ((filterParams.atkinson || {}).levels ?? 2);
+    const imageData = ctx.getImageData(0, 0, width, height);
+    const data = imageData.data;
+    const atkOrig = new Uint8ClampedArray(data);
+
+    const lums   = new Float32Array(width * height);
+    const errors = new Float32Array(width * height);
+    for (let i = 0; i < width * height; i++) {
+      lums[i] = data[i * 4] * 0.299 + data[i * 4 + 1] * 0.587 + data[i * 4 + 2] * 0.114;
+    }
+
+    const step = 255 / (levels - 1);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = y * width + x;
+        const val = Math.max(0, Math.min(255, lums[idx] + errors[idx]));
+        const quantized = Math.round(val / step) * step;
+        const err = (val - quantized) / 8; // Atkinson: 1/8 to six neighbours
+        lums[idx] = quantized;
+        if (x + 1 < width)                 errors[idx + 1]         += err;
+        if (x + 2 < width)                 errors[idx + 2]         += err;
+        if (y + 1 < height) {
+          if (x - 1 >= 0)                  errors[idx + width - 1] += err;
+                                            errors[idx + width]     += err;
+          if (x + 1 < width)               errors[idx + width + 1] += err;
+        }
+        if (y + 2 < height)                errors[idx + width * 2] += err;
+      }
+    }
+
+    for (let i = 0; i < width * height; i++) {
+      const v = Math.round(lums[i]);
+      data[i * 4]     = v;
+      data[i * 4 + 1] = v;
+      data[i * 4 + 2] = v;
+    }
+    const tat = Math.min(1, Math.max(0, intensity));
+    if (tat < 1) {
+      for (let i = 0; i < data.length; i += 4) {
+        data[i]   = Math.round(atkOrig[i]   * (1 - tat) + data[i]   * tat);
+        data[i+1] = Math.round(atkOrig[i+1] * (1 - tat) + data[i+1] * tat);
+        data[i+2] = Math.round(atkOrig[i+2] * (1 - tat) + data[i+2] * tat);
+      }
+    }
+    ctx.putImageData(imageData, 0, 0);
+    return;
+
   }
 
   // Composite the effect onto the main canvas at the requested intensity

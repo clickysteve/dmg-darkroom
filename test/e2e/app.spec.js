@@ -107,8 +107,10 @@ test('imports an image into an empty slot, then undo/redo', async ({ page }) => 
   await loadSyntheticSav(page);
 
   const chooser = page.waitForEvent('filechooser');
-  // The button may be collapsed into the Actions ▾ overflow menu — click via JS
+  // The button may be collapsed into the Actions ▾ overflow menu — click via JS,
+  // then pick a dither algorithm from the popover
   await page.locator('#btn-import-image').evaluate((el) => el.click());
+  await page.locator('.action-popover .overflow-item', { hasText: 'Atkinson' }).click();
   await (await chooser).setFiles(path.join(__dirname, '..', '..', 'docs', 'icon.png'));
 
   await expect(page.locator('#toast')).toContainText('Imported into slot 03');
@@ -146,6 +148,60 @@ test('golden render: photo 0 thumbnail is pixel-stable', async ({ page }) => {
   } else {
     expect(hash).toBe(fs.readFileSync(goldenPath, 'utf8'));
   }
+});
+
+test('new FX render and visibly change pixels', async ({ page }) => {
+  await loadSyntheticSav(page);
+  const results = await page.evaluate(() => {
+    const out = {};
+    const baseline = () => {
+      const canvas = document.querySelector('.photo-slot[data-index="0"] canvas');
+      return canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+    };
+    state.sectionEnabled.effects = true;
+    const before = Uint8ClampedArray.from(baseline());
+    for (const fx of ['printer', 'tilecorrupt', 'zine', 'atkinson']) {
+      state.activeFilters = new Set([fx]);
+      clearThumbCache();
+      repaintGrid();
+      const after = baseline();
+      let changed = 0;
+      for (let i = 0; i < before.length; i += 4) {
+        if (before[i] !== after[i] || before[i+1] !== after[i+1] || before[i+2] !== after[i+2]) changed++;
+      }
+      out[fx] = changed;
+    }
+    state.activeFilters = new Set();
+    state.sectionEnabled.effects = false;
+    clearThumbCache();
+    repaintGrid();
+    return out;
+  });
+  for (const [fx, changed] of Object.entries(results)) {
+    expect(changed, `${fx} should change pixels`).toBeGreaterThan(1000);
+  }
+});
+
+test('blends two photos into a new slot with undo', async ({ page }) => {
+  await loadSyntheticSav(page);
+  // Multi-select photos 0 and 1
+  await page.click('.photo-slot[data-index="0"]');
+  await page.click('.photo-slot[data-index="1"]', { modifiers: ['ControlOrMeta'] });
+  await page.locator('#btn-blend').evaluate((el) => el.click());
+  await page.locator('.action-popover .overflow-item', { hasText: 'Darken' }).click();
+  await expect(page.locator('#toast')).toContainText('Blended into slot 03');
+  await expect(page.locator('.photo-slot:not(.empty)')).toHaveCount(3);
+
+  // Blend math: darken = max of the two index maps
+  const ok = await page.evaluate(() => {
+    const a = state.photos[0].pixels, b = state.photos[1].pixels, c = state.photos[2].pixels;
+    for (let i = 0; i < c.length; i++) if (c[i] !== Math.max(a[i], b[i])) return false;
+    return true;
+  });
+  expect(ok).toBe(true);
+
+  await page.keyboard.press('ControlOrMeta+z');
+  await expect(page.locator('.photo-slot:not(.empty)')).toHaveCount(2);
 });
 
 test('webgl tone parity: GPU output matches CPU within ±2', async ({ page }) => {

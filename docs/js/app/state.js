@@ -35,7 +35,7 @@ const state = {
   activeFilters:   new Set(),        // active filter names for stackable effects
   sectionEnabled:  { exposure: false, splitTone: false, effects: false }, // per-section on/off (off by default)
   effectsPreviewMode: false, // toggle before/after for effects; false = effects visible (normal rendering)
-  filterOrder: ['crt', 'lcd', 'grid', 'vignette', 'halftone', 'dot', 'glow', 'chroma', 'jitter', 'noise', 'ghosting', 'pixsort', 'blkglitch', 'wavewarp', 'zoomblur', 'bayer', 'floyd', 'interlace', 'chswap', 'rgbplanes', 'colcorrupt'],
+  filterOrder: ['crt', 'lcd', 'grid', 'vignette', 'halftone', 'dot', 'glow', 'chroma', 'jitter', 'noise', 'ghosting', 'pixsort', 'blkglitch', 'wavewarp', 'zoomblur', 'bayer', 'floyd', 'atkinson', 'interlace', 'chswap', 'rgbplanes', 'colcorrupt', 'printer', 'tilecorrupt', 'zine'],
   gifPreviewTimer: null,   // setInterval handle for live GIF preview
   lightboxOpen: false,     // lightbox overlay visible
   viewMode: 'grid',        // 'grid' | 'solo'
