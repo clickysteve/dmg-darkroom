@@ -45,6 +45,7 @@
 - Photos display in their true in-camera album order (bank 0 state vector)
 - Deleted-photo recovery — photos deleted in-camera but not yet overwritten are shown with a "recovered" badge
 - Hidden "last seen" image from the start of SRAM shown as an extra slot (LS)
+- Photo metadata decoded from the save: photographer name, gender, birthdate, comment, and link-cable copy flag (shown in solo view and lightbox)
 
 **Import**
 - Import any image into an empty photo slot — cover-cropped to 128×112 and dithered to 4 shades (Bayer ordered dithering), written back with thumbnail, metadata, and album entry
@@ -79,6 +80,7 @@
 | Key | Action |
 |-----|--------|
 | `Cmd/Ctrl+Z` | Undo |
+| `Shift+Cmd/Ctrl+Z` | Redo |
 | `Cmd/Ctrl+C` | Copy settings |
 | `Cmd/Ctrl+V` | Paste settings |
 | `Cmd/Ctrl+A` | Select all photos |
@@ -105,9 +107,18 @@ No installation. No sign-up. Runs entirely in your browser — and works offline
 ## Technical notes
 
 - Game Boy Camera SRAM: 128KB, photos at `0x2000`, 30 slots × 3584 bytes, 128×112px 2bpp
-- Bank 0 album state vector at `0x11B2`: 30 bytes, one per slot — album position, or `0xFF` for deleted/unused (used for album ordering, deleted-photo recovery, and empty-slot detection)
-- "Last seen" working image: 3584 bytes at `0x0000`, same tile format
+- Bank 0 album state vector at `0x11B2`: 30 bytes, one per slot — album position, or `0xFF` for deleted/unused (used for album ordering, deleted-photo recovery, and empty-slot detection). Protected by a "Magic" string + sum/xor checksum + echo copy, all maintained on write
+- Per-slot metadata at `+0xF00`: user ID, name, gender/blood, birthdate, comment, hotspots, in-camera border index, "Magic" + checksum, echo at `+0xF5C` (the stock camera stores no exposure settings)
+- "Last seen" working image: 3584 bytes at `0x0100`, same tile format
 - `.srm` files are raw SRAM dumps in RetroArch format — identical structure to `.sav`
+- Tone adjustments render on the GPU (WebGL) when hardware acceleration is available, with an automatic bit-equivalent CPU fallback; exports always use the CPU path for reproducibility
+
+## Development
+
+- `renderer/js/app/` holds the app modules (classic scripts, shared global scope — load order in `index.html` matters); `docs/` is the deployed web build, synced via `npm run sync:web`
+- `npm test` — unit tests for the SRAM decoder/encoder (node)
+- `npm run test:e2e` — Playwright end-to-end tests against the web build (`npx playwright install chromium` first)
+- CI runs both suites plus a renderer/docs sync check on every push
 
 ---
 

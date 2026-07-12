@@ -6,7 +6,15 @@
  * refreshed from the network in the background for next load.
  */
 
-const CACHE = 'dmg-darkroom-v1';
+const CACHE = 'dmg-darkroom-v2';
+
+const APP_MODULES = [
+  'core-render', 'filter-defs', 'state', 'grid-views', 'palette-core',
+  'export-png', 'gif', 'file-open', 'ui-wiring', 'palettes-ui',
+  'gif-preview', 'palettes-extra', 'webgl-tone', 'filters-engine', 'sav-io', 'project',
+  'presentation', 'keyboard', 'sidebar-wiring', 'undo', 'filters-ui',
+  'app-init',
+].map((m) => `./js/app/${m}.js`);
 
 const SHELL = [
   './',
@@ -16,7 +24,7 @@ const SHELL = [
   './js/palettes-ext.js',
   './js/gbcam.js',
   './js/web-api.js',
-  './js/app.js',
+  ...APP_MODULES,
   './js/gifenc.esm.js',
   './js/gif-worker.js',
   './js/jszip.esm.js',

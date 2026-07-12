@@ -22,7 +22,7 @@
  * AntonioND's docs, and gbcam2png by raphnet.
  */
 
-window.GBCam = (() => {
+const GBCam = (() => {
   // ── Constants ──────────────────────────────────────────────────────────────
 
   const PHOTO_WIDTH       = 128;
@@ -39,10 +39,17 @@ window.GBCam = (() => {
   const SRAM_SIZE         = 131072;  // 128KB
 
   // Bank 0 structures
-  const LAST_SEEN_OFFSET    = 0x0000;  // "last seen" working image (128×112 2bpp, 0xE00 bytes)
+  // The capture buffer at 0x0000–0x0FFF is 128×128 (256 tiles); the usable
+  // 128×112 "last seen" image starts one tile row in, at 0x0100.
+  const LAST_SEEN_OFFSET    = 0x0100;
   const STATE_VECTOR_OFFSET = 0x11B2;  // 30 bytes: album position per slot, 0xFF = deleted/unused
+  const VECTOR_MAGIC_OFFSET = 0x11D0;  // ASCII "Magic"
+  const VECTOR_CKSUM_OFFSET = 0x11D5;  // sum/xor over 0x11B2–0x11D4
+  const VECTOR_ECHO_OFFSET  = 0x11D7;  // byte-identical echo of 0x11B2–0x11D6
   const THUMB_OFFSET        = 0xE00;   // per-slot thumbnail (256 bytes = 16 tiles)
-  const META_OFFSET         = 0xF00;   // per-slot metadata / camera settings (256 bytes)
+  const META_OFFSET         = 0xF00;   // per-slot metadata (see decodeSlotMeta)
+  const META_ECHO_OFFSET    = 0xF5C;   // byte-identical echo of 0xF00–0xF5B
+  const MAGIC = [0x4D, 0x61, 0x67, 0x69, 0x63]; // ASCII "Magic"
 
   // ── Tile decoder ──────────────────────────────────────────────────────────
   //
@@ -123,14 +130,29 @@ window.GBCam = (() => {
   }
 
   /**
+   * Set one slot's album-vector entry and recompute the vector's Magic,
+   * checksum, and echo — all three must be consistent or the camera treats
+   * the save as corrupt and wipes it at boot.
+   */
+  function setStateVectorEntry(sav, slotIndex, value) {
+    sav[STATE_VECTOR_OFFSET + slotIndex] = value & 0xFF;
+    MAGIC.forEach((b, i) => { sav[VECTOR_MAGIC_OFFSET + i] = b; });
+    const ck = blockChecksum(sav, STATE_VECTOR_OFFSET, VECTOR_MAGIC_OFFSET + 4);
+    sav[VECTOR_CKSUM_OFFSET]     = ck.sum;
+    sav[VECTOR_CKSUM_OFFSET + 1] = ck.xor;
+    // Echo of the whole block (vector + Magic + checksum) at 0x11D7
+    const len = VECTOR_CKSUM_OFFSET + 2 - STATE_VECTOR_OFFSET; // 0x25 bytes
+    for (let i = 0; i < len; i++) sav[VECTOR_ECHO_OFFSET + i] = sav[STATE_VECTOR_OFFSET + i];
+  }
+
+  /**
    * Write an imported photo (pixel indices 0–3, 128×112) into a slot:
    *  - image tiles at the slot base
    *  - a 32×32 thumbnail (4×4 tiles) into the thumbnail region
-   *  - metadata copied from donorSlot (keeps a self-consistent metadata+checksum
-   *    block, the same trick community injectors use), or zeroed if none
-   *  - state vector entry set to albumPos (when the vector is valid)
+   *  - a fresh, checksummed metadata block (+ echo)
+   *  - state vector entry set to albumPos, with vector checksum + echo updated
    */
-  function writePhotoToSlot(sav, slotIndex, pixels, { donorSlot = null, albumPos = null } = {}) {
+  function writePhotoToSlot(sav, slotIndex, pixels, { albumPos = null } = {}) {
     const base = PHOTO_DATA_OFFSET + slotIndex * SLOT_SIZE;
     encodePhotoAt(sav, base, pixels);
 
@@ -156,15 +178,13 @@ window.GBCam = (() => {
       }
     }
 
-    // Metadata: copy from donor slot so checksums stay internally consistent
-    if (donorSlot !== null && donorSlot !== slotIndex) {
-      const donorBase = PHOTO_DATA_OFFSET + donorSlot * SLOT_SIZE;
-      for (let i = 0; i < 256; i++) sav[base + META_OFFSET + i] = sav[donorBase + META_OFFSET + i];
-    }
+    // Fresh metadata block with valid Magic + checksum + echo
+    writeSlotMeta(sav, slotIndex);
 
     // State vector: mark the slot used at the requested album position
+    // (recomputes the vector checksum + echo so the camera accepts the save)
     if (albumPos !== null && readStateVector(sav)) {
-      sav[STATE_VECTOR_OFFSET + slotIndex] = albumPos & 0xFF;
+      setStateVectorEntry(sav, slotIndex, albumPos);
     }
   }
 
@@ -186,6 +206,136 @@ window.GBCam = (() => {
 
   function isPhotoEmpty(sav, photoIndex) {
     return isRegionBlank(sav, PHOTO_DATA_OFFSET + photoIndex * SLOT_SIZE);
+  }
+
+  // ── Checksums ───────────────────────────────────────────────────────────────
+  //
+  // Every "Magic" block in the save (per-slot metadata, album vector, owner
+  // block) is protected by the same pair: an 8-bit SUM seeded 0x4E and an
+  // 8-bit XOR seeded 0x54, computed over the block INCLUDING its "Magic"
+  // string. A wrong checksum (or missing "Magic") makes the camera wipe the
+  // entire save at boot — so anything that writes SRAM must recompute these.
+  // Ref: Raphael-Boichot/Inject-pictures-in-your-Game-Boy-Camera-saves,
+  //      untoxa/gb-photo (CAMERA_SUM_SEED/CAMERA_XOR_SEED), funtography wiki.
+
+  function blockChecksum(sav, start, endInclusive) {
+    let sum = 0x4E, xor = 0x54;
+    for (let i = start; i <= endInclusive; i++) {
+      sum = (sum + sav[i]) & 0xFF;
+      xor ^= sav[i];
+    }
+    return { sum, xor };
+  }
+
+  // ── Per-slot metadata (slot-relative 0xF00–0xF5B, echo at 0xF5C) ────────────
+  //
+  //   0xF00–0xF03  user ID (8 digits, one per nibble, stored digit+1; 0 = blank)
+  //   0xF04–0xF0C  user name (9 chars, GB Camera charset)
+  //   0xF0D        gender (bits 0–1: 0 none / 1 male / 2 female), blood type (>>2)
+  //   0xF0E–0xF11  birthdate (nibble digits: year ×4, then two 2-digit fields)
+  //   0xF15–0xF2F  comment (27 chars = 3 lines × 9)
+  //   0xF33        0 = original, 1 = copy (received via link cable)
+  //   0xF36–0xF53  hotspot data (sounds/effects, 5 slots)
+  //   0xF54        border/frame index chosen in-camera
+  //   0xF55–0xF59  ASCII "Magic"
+  //   0xF5A–0xF5B  checksum (sum, xor) over 0xF00–0xF59
+  //
+  // Note: the stock camera does NOT store exposure/dither/edge settings in the
+  // save — only the border index survives. (Confirmed across Boichot, untoxa,
+  // and the funtography wiki.)
+
+  // International-ROM character set (byte → char). 0x00 terminates.
+  const CHARSET_INT = (() => {
+    const map = {};
+    const put = (start, str) => { [...str].forEach((ch, i) => { map[start + i] = ch; }); };
+    put(0x32, '♥');
+    put(0x56, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ');
+    put(0x70, "_',.");
+    put(0x74, 'ÁÂÀÄÉÊÈËÍÏÓÖÚÜÑ');
+    put(0x83, '-&!? ');
+    put(0x88, 'abcdefghijklmnopqrstuvwxyz');
+    put(0xA2, '·~☎ ');
+    put(0xA6, 'áâàäéêèëíïóöúüñ');
+    put(0xB5, 'çß☺☹');
+    put(0xBA, '0123456789');
+    put(0xC4, '/:˜"@');
+    return map;
+  })();
+
+  function decodeText(sav, offset, length) {
+    let out = '';
+    for (let i = 0; i < length; i++) {
+      const b = sav[offset + i];
+      if (b === 0x00) break;
+      out += CHARSET_INT[b] ?? ' ';
+    }
+    return out.trim();
+  }
+
+  function decodeNibbleDigits(sav, offset, byteLen) {
+    let out = '';
+    for (let i = 0; i < byteLen; i++) {
+      for (const nib of [sav[offset + i] >> 4, sav[offset + i] & 0x0F]) {
+        out += (nib >= 0x1 && nib <= 0xA) ? String(nib - 1) : '-';
+      }
+    }
+    return out;
+  }
+
+  const GENDERS = { 1: 'male', 2: 'female' };
+  const BLOODS  = { 1: 'A', 2: 'B', 3: 'O', 4: 'AB' };
+
+  /** Decode the metadata block of a photo slot. Returns null for out-of-range slots. */
+  function decodeSlotMeta(sav, slotIndex) {
+    if (slotIndex < 0 || slotIndex >= PHOTO_COUNT) return null;
+    const base = PHOTO_DATA_OFFSET + slotIndex * SLOT_SIZE;
+    const m = base + META_OFFSET;
+
+    const magicOk = MAGIC.every((b, i) => sav[m + 0x55 + i] === b);
+    const ck = blockChecksum(sav, m, m + 0x59);
+    const checksumValid = magicOk && sav[m + 0x5A] === ck.sum && sav[m + 0x5B] === ck.xor;
+
+    const genderByte = sav[m + 0x0D];
+    const birth = decodeNibbleDigits(sav, m + 0x0E, 4); // YYYY + two 2-digit fields (day/month order differs between sources)
+
+    const commentLines = [];
+    for (let line = 0; line < 3; line++) {
+      const txt = decodeText(sav, m + 0x15 + line * 9, 9);
+      if (txt) commentLines.push(txt);
+    }
+
+    return {
+      userId:      decodeNibbleDigits(sav, m, 4),
+      userName:    decodeText(sav, m + 0x04, 9),
+      gender:      GENDERS[genderByte & 0x03] || null,
+      bloodType:   BLOODS[genderByte >> 2] || null,
+      birthdate:   /^-+$/.test(birth) ? null : birth,   // "YYYYxxyy" digit string
+      comment:     commentLines.join(' '),
+      isCopy:      sav[m + 0x33] === 0x01,
+      borderIndex: sav[m + 0x54],
+      checksumValid,
+    };
+  }
+
+  /** Write a fresh, checksummed metadata block (blank profile, hotspots off). */
+  function writeSlotMeta(sav, slotIndex, { borderIndex = 0 } = {}) {
+    const m = PHOTO_DATA_OFFSET + slotIndex * SLOT_SIZE + META_OFFSET;
+    for (let i = 0; i <= 0x5B; i++) sav[m + i] = 0x00;
+    for (let i = 0; i < 4; i++) sav[m + i] = 0x11;            // user ID "00000000"
+    // name, gender, birthdate, comment left blank (0x00)
+    for (let i = 0; i < 5; i++) {
+      sav[m + 0x36 + i] = 0x00;                                // hotspots off
+      sav[m + 0x45 + i] = 0xFF;                                // hotspot sound off
+      sav[m + 0x4A + i] = 0xFF;                                // hotspot effect off
+      sav[m + 0x4F + i] = 0xFF;                                // hotspot jump off
+    }
+    sav[m + 0x54] = borderIndex & 0xFF;
+    MAGIC.forEach((b, i) => { sav[m + 0x55 + i] = b; });
+    const ck = blockChecksum(sav, m, m + 0x59);
+    sav[m + 0x5A] = ck.sum;
+    sav[m + 0x5B] = ck.xor;
+    // Echo copy at 0xF5C–0xFB7 (the camera cross-checks / repairs from it)
+    for (let i = 0; i <= 0x5B; i++) sav[m + 0x5C + i] = sav[m + i];
   }
 
   // ── Bank 0: album state vector ─────────────────────────────────────────────
@@ -312,7 +462,7 @@ window.GBCam = (() => {
 
   // ── Exported API ──────────────────────────────────────────────────────────
 
-  return {
+  const api = {
     PHOTO_WIDTH,
     PHOTO_HEIGHT,
     PHOTO_COUNT,
@@ -322,5 +472,12 @@ window.GBCam = (() => {
     renderToCanvas,
     readStateVector,
     writePhotoToSlot,
+    decodeSlotMeta,
+    blockChecksum,
   };
+  return api;
 })();
+
+// Dual-environment export: browser global + node (for the unit test suite)
+if (typeof window !== 'undefined') window.GBCam = GBCam;
+if (typeof module !== 'undefined' && module.exports) module.exports = GBCam;

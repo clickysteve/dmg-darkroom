@@ -19,12 +19,18 @@ cd "$ROOT"
 
 echo "▶ Syncing renderer/ → docs/"
 
-cp renderer/js/app.js          docs/js/app.js
+mkdir -p docs/js/app
+cp renderer/js/app/*.js        docs/js/app/
 cp renderer/js/gbcam.js        docs/js/gbcam.js
 cp renderer/js/palettes.js     docs/js/palettes.js
 cp renderer/js/palettes-ext.js docs/js/palettes-ext.js
 cp renderer/css/style.css      docs/css/style.css
 cp renderer/frames/*.png       docs/frames/
+
+# Remove app/ modules that no longer exist in renderer/
+for f in docs/js/app/*.js; do
+  [ -e "renderer/js/app/$(basename "$f")" ] || rm "$f"
+done
 
 echo "✓ docs/ is in sync with renderer/"
 echo ""

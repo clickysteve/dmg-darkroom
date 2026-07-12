@@ -4,3 +4,5 @@ dist/
 *.dmg
 test_saves/
 _local/
+test-results/
+playwright-report/
